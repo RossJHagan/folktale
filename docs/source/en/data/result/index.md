@@ -47,37 +47,77 @@ In JavaScript you're often left with two major ways of dealing with these
 failures: a branching instruction (like `if/else`), or throwing errors and
 catching them.
 
+To see how `Result` compares to these, we'll look at a function that needs to
+validate some information, and that incorporates some more complex validation
+rules. A person may sign-up for a service by providing the form they would
+prefer being contacted (email or phone), and the information related to that
+preference has to be provided, but any other info is optional::
+
+    // Functions to assert the format of each data
+    const isValidName  = (name)  => name.trim() !== '';
+    const isValidEmail = (email) => /(.+)@(.+)/.test(email);
+    const isValidPhone = (phone) => /^\d+$/.test(phone);
+
+    // Objects representing each possible failure in the validation
+    const { data, setoid } = require('folktale/core/adt');
+    
+    const ValidationErrors = data('validation-errors', {
+      Required(field) {
+        return { field };
+      },
+      
+      InvalidEmail(email) {
+        return { email };
+      },
+      
+      InvalidPhone(phone) {
+        return { phone };
+      },
+      
+      InvalidType(type) {
+        return { type };
+      },
+      
+      Optional(error) {
+        return { error };
+      }
+    }).derive(setoid);
+    
+    const { 
+      Required, 
+      InvalidEmail, 
+      InvalidPhone, 
+      InvalidType, 
+      Optional 
+    } = ValidationErrors;
+
 Branching stops being a very feasible thing after a couple of cases. It's very
 simple to forget to handle failures (often with catastrophic effects, as can be
 seen in things like NullPointerException and the likes), and there's no error
 propagation, so every part of the code has to handle the same error over and
 over again::
 
-    const isValidEmail = (email) => /(.+)@(.+)/.test(email);
-    
-    const isValidPhone = (phone) => /^\d+$/.test(phone);
-
     const validateBranching = ({ name, type, email, phone }) => {
-      if (name.trim() === '') {
-        return '`name` can’t be empty.';
+      if (!isValidName(name)) {
+        return Required('name');
       } else if (type === 'email') {
         if (!isValidEmail(email)) {
-          return 'Please provide a valid email';
+          return InvalidEmail(email);
         } else if (phone && !isValidPhone(phone)) {
-          return 'The phone number is not valid';
+          return Optional(InvalidPhone(phone));
         } else {
           return { type, name, email, phone };
         }
       } else if (type === 'phone') {
         if (!isValidPhone(phone)) {
-          return 'Please provide a valid phone number';
+          return InvalidPhone(phone);
         } else if (email && !isValidEmail(email)) {
-          return 'The email is not valid';
+          return Optional(InvalidEmail(email));
         } else {
           return { type, name, email, phone };
         }
       } else {
-        return 'The type should be either `phone` or `email`';
+        return InvalidType(type);
       }
     };
     
@@ -87,7 +127,7 @@ over again::
       type: 'email',
       phone: '11234456'
     });
-    // ==> 'Please provide a valid email'
+    // ==> InvalidEmail(undefined)
     
     validateBranching({
       name: 'Alissa',
@@ -103,35 +143,37 @@ often results in crashing the process, which is better than continuing but doing
 the wrong thing—, but they allow failures to propagate, so fewer places in the
 code need to really deal with the problem::
 
-    const assertEmail = (email) => {
+    const id = (a) => a;
+
+    const assertEmail = (email, wrapper=id) => {
       if (!isValidEmail(email)) {
-        throw new Error('Please provide a valid email');
+        throw wrapper(InvalidEmail(email));
       }
     };
     
-    const assertPhone = (phone) => {
+    const assertPhone = (phone, wrapper=id) => {
       if (!isValidPhone(phone)) {
-        throw new Error('Please provie a valid phone number');
+        throw wrapper(InvalidEmail(email));
       }
     };
 
     const validateThrow = ({ name, type, email, phone }) => {
-      if (name.trim() === '') {
-        throw new Error('`name` can’t be empty');
+      if (!isValidName(name)) {
+        throw Required('name');
       }
       switch (type) {
         case 'email':
           assertEmail(email);
-          if (phone)  assertPhone(phone);
+          if (phone)  assertPhone(phone, Optional);
           return { type, name, email, phone };
           
         case 'phone':
           assertPhone(phone);
-          if (email)  assertEmail(email);
+          if (email)  assertEmail(email, Optional);
           return { type, name, email, phone };
           
         default:
-          throw new Error('The type should be either `phone` or `email`');
+          throw InvalidType(type);
       }
     };
 
@@ -143,7 +185,7 @@ code need to really deal with the problem::
         phone: '11234456'
       });
     } catch (e) {
-      e.message; // ==> 'Please provide a valid email'
+      e; // ==> InvalidEmail(undefined)
     }
     
     validateThrow({
@@ -161,11 +203,66 @@ recover from a failure when you don't know in which state your application is?
 
 `Result` helps with both of these cases. With a `Result`, the user is forced to
 be aware of the failure, since they're not able to use the value at all without
-unwrapping the value before. At the same time, using a `Result` value will
+unwrapping the value first. At the same time, using a `Result` value will
 automatically propagate the errors when they're not handled, making error
 handling easier. Since `Result` runs one operation at a time when you use the
 value, and does not do any dynamic stack unwinding (as `throw` does), it's much
 easier to understand in which state your application should be.
 
+Using `Result`, the previous examples would look like this::
+
+    const Result = require('folktale/data/result');
+    
+    const checkName = (name) =>
+      isValidName(name) ?  Result.Ok(name)
+    : /* otherwise */      Result.Error(Required('name'));
+    
+    const checkEmail = (email) =>
+      isValidEmail(email) ?  Result.Ok(email)
+    : /* otherwise */        Result.Error(InvalidEmail(email));
+    
+    const checkPhone = (phone) =>
+      isValidPhone(phone) ?  Result.Ok(phone)
+    : /* otherwise */        Result.Error(InvalidPhone(phone));
+    
+    const optional = (check) => (value) =>
+      value           ?  check(value).mapError(Optional)
+    : /* otherwise */    Result.Ok(value);
+    
+    const maybeCheckEmail = optional(checkEmail);
+    const maybeCheckPhone = optional(checkPhone);
+    
+
+    const validateResult = ({ name, type, email, phone }) =>
+      checkName(name).chain(_ => 
+        type === 'email' ?  checkEmail(email).chain(_ =>
+                              maybeCheckPhone(phone).map(_ => ({
+                                name, type, email, phone
+                              }))
+                            )
+                            
+      : type === 'phone' ?  checkPhone(phone).chain(_ =>
+                              maybeCheckEmail(email).map(_ => ({
+                                name, type, email, phone
+                              }))
+                            )
+                            
+      : /* otherwise */     Result.Error(InvalidType(type))
+      );
+
+
+    validateResult({
+      name: 'Max',
+      type: 'email',
+      phone: '11234456'
+    });
+    // ==> Result.Error(InvalidEmail(undefined))
+    
+    validateResult({
+      name: 'Alissa',
+      type: 'email',
+      email: 'alissa@somedomain'
+    });
+    // => Result.Ok({ name: 'Alissa', type: 'email', phone: undefined, email: 'alissa@somedomain' })
 
 
